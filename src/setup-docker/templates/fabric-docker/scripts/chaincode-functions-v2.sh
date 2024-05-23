@@ -2,6 +2,8 @@
 # phrase "${CA_CERT_PARAMS[@]+"${CA_CERT_PARAMS[@]}"}" is needed in older bash versions ( <4 ) for array expansion.
 # see: https://stackoverflow.com/questions/7577052/bash-empty-array-expansion-with-set-u
 
+CC_PACKAGE_ID=""
+
 dockerPullIfMissing() {
   local IMAGE="$1"
   if [[ "$(docker images -q "$IMAGE" 2>/dev/null)" == "" ]]; then
@@ -9,7 +11,7 @@ dockerPullIfMissing() {
   fi
 }
 
-chaincodeBuild() {
+chaincodeBuildDirPath() {
   local CHAINCODE_NAME=$1
   local CHAINCODE_LANG=$2
   local CHAINCODE_DIR_PATH=$3
@@ -73,6 +75,81 @@ chaincodeBuild() {
     fi
   fi
 }
+
+chaincodeBuildCCAASImage() {
+  local CHAINCODE_NAME=$1
+  local CHAINCODE_DIR_PATH=$2
+    # build the docker container
+  echo "Building Chaincode-as-a-Service docker image '${CHAINCODE_NAME}' '${CHAINCODE_DIR_PATH}'"
+  echo "This may take several minutes..."
+  docker build -f "$CHAINCODE_DIR_PATH"/Dockerfile -t "${CHAINCODE_NAME}"_ccaas_image:latest --build-arg CC_SERVER_PORT=9999 "$CHAINCODE_DIR_PATH" >&log.txt
+}
+
+chaincodeExternalPackage() {
+  local CLI_NAME=$1
+  local PEER_ADDRESS=$2
+  local CHAINCODE_NAME=$3
+  local CHAINCODE_VERSION=$4
+  local CHAINCODE_LABEL="${CHAINCODE_NAME}_$CHAINCODE_VERSION"
+  local CHAINCODE_LANG=$5
+  local CCAAS_SERVER_PORT=9999
+
+  echo "Packaging external chaincode $CHAINCODE_NAME..."
+  inputLog "CHAINCODE_VERSION: $CHAINCODE_VERSION"
+  inputLog "CHAINCODE_LANG: $CHAINCODE_LANG"
+  inputLog "PEER_ADDRESS: $PEER_ADDRESS"
+  inputLog "CLI_NAME: $CLI_NAME"
+  inputLog "CCAAS_SERVER_PORT: $CCAAS_SERVER_PORT"
+
+  local address="${CHAINCODE_NAME}_ccaas:${CCAAS_SERVER_PORT}"
+
+  docker exec "$CLI_NAME" mktemp -d -t 'chaincode.XXXXXXXX' > tempdir.txt
+  TEMP_DIR=$(cat tempdir.txt)
+
+  docker exec "$CLI_NAME" mkdir -p "$TEMP_DIR"/src
+  docker exec "$CLI_NAME" mkdir -p "$TEMP_DIR"/pkg
+
+  docker exec "$CLI_NAME" sh -c "echo '{
+    \"address\": \"${address}\",
+    \"dial_timeout\": \"10s\",
+    \"tls_required\": false
+  }' > $TEMP_DIR/src/connection.json"
+
+  docker exec "$CLI_NAME" sh -c "echo '{
+    \"type\": \"ccaas\",
+    \"label\": \"$CHAINCODE_LABEL\"
+  }' > $TEMP_DIR/pkg/metadata.json"
+
+  docker exec "$CLI_NAME" tar -C "$TEMP_DIR"/src -czf "$TEMP_DIR"/pkg/code.tar.gz .
+
+  docker exec "$CLI_NAME" tar -C "$TEMP_DIR"/pkg -czf /var/hyperledger/cli/chaincode-packages/"$CHAINCODE_LABEL".tar.gz metadata.json code.tar.gz
+
+  docker exec "$CLI_NAME" rm -Rf "$TEMP_DIR"
+
+  # Calculate package ID
+  docker exec "$CLI_NAME" peer lifecycle chaincode calculatepackageid /var/hyperledger/cli/chaincode-packages/"$CHAINCODE_LABEL".tar.gz
+
+  # Clean up local temp file
+  rm tempdir.txt
+
+  docker exec "$CLI_NAME" chown "$(id -u):$(id -g)" "/var/hyperledger/cli/chaincode-packages/$CHAINCODE_LABEL.tar.gz"
+  inputLog "$CHAINCODE_LABEL"
+
+  inputLog "Chaincode is packaged  ${address}"
+}
+
+chaincodeRunCCAASContainers() {
+  echo "Running Chaincode-as-a-Service container"
+  local CHAINCODE_NAME=$1
+  local CCAAS_SERVER_PORT=9999
+
+  docker run --rm -d --name "${CHAINCODE_NAME}"_ccaas --network "${COMPOSE_PROJECT_NAME}_basic" \
+   -e CHAINCODE_SERVER_ADDRESS=0.0.0.0:${CCAAS_SERVER_PORT} \
+   -e CHAINCODE_ID="$CC_PACKAGE_ID" -e CORE_CHAINCODE_ID_NAME="$CC_PACKAGE_ID" \
+                      "${CHAINCODE_NAME}"_ccaas_image:latest
+
+}
+
 
 chaincodePackage() {
   local CLI_NAME=$1
@@ -167,7 +244,6 @@ chaincodeApprove() {
   fi
 
   local QUERYINSTALLED_RESPONSE
-  local CC_PACKAGE_ID
 
   QUERYINSTALLED_RESPONSE="$(
     docker exec -e CORE_PEER_ADDRESS="$PEER_ADDRESS" "$CLI_NAME" peer lifecycle chaincode queryinstalled \
